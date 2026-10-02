@@ -1,5 +1,7 @@
 # M1 Windows AD Scripts — NovaCorp (TP07)
 
+README : généré en partie par IA (Gemini-Pro) : peut contenir des erreurs.
+
 Scripts PowerShell pour monter et peupler l'annuaire Active Directory de NovaCorp à partir d'un fichier CSV, puis en contrôler la conformité.
 
 | Script | Rôle | Modifie l'AD ? |
@@ -247,6 +249,3 @@ Get-Content $log.FullName | Select-String 'WARN|ERROR|Bilan'
 | Téléchargement GitHub impossible après la promotion | le DNS du serveur est `127.0.0.1` : copier le ZIP depuis un autre poste |
 | Lignes `WhatIf : ... Définir l'alias` | bruit du chargement d'un module en simulation, sans conséquence |
 
----
-
-## Recommencer de zéro
