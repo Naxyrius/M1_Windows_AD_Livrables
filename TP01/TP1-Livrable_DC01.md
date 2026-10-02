@@ -225,3 +225,16 @@ L'OU NovaCorp existe déjà, aucune création.
 L'OU RH existe déjà, aucune création.
 L'OU IT existe déjà, aucune création.
 L'OU Finance existe déjà, aucune création.
+
+
+## Validation d'apaprtenance SRV01
+
+```
+(Get-CimInstance Win32_ComputerSystem) | Select Name, Domain, PartOfDomain
+
+Name  Domain        PartOfDomain
+----  ------        ------------
+SRV01 novacorp.test         True
+```
+
+Le srv01 a bien rejoint le domaine
