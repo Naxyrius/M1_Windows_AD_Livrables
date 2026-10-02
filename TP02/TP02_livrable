@@ -1,0 +1,701 @@
+# TP02 — Identités, RBAC, AGDLP et File Server
+
+Commandes exécutées sur **SRV01** (PowerShell administrateur, session `NOVACORP\Administrateur`) et commandes de vérification. Les blocs de la partie A sont les versions **finales** (après corrections) ; elles sont rejouables, chaque création teste d'abord l'existence.
+
+Variables communes : `$svc = "Finance","IT","RH","Support"`.
+
+## Sommaire
+
+1. [État d'avancement](#1-état-davancement)
+2. [Modèle AGDLP et matrice d'accès (livrable)](#2-modèle-agdlp-et-matrice-daccès-livrable)
+3. [Partie A — Setup](#partie-a--setup-dans-lordre)
+4. [Partie B — Vérifications](#partie-b--vérifications-point-par-point)
+5. [Partie C — Contrôle global en une passe](#partie-c--contrôle-global-en-une-passe)
+6. [Reste à faire avant rendu](#reste-à-faire-avant-rendu)
+
+---
+
+## 1. État d'avancement
+
+| Niveau | Exigence | État | Remarque |
+|---|---|---|---|
+| 🟢 | Import des utilisateurs | Fait | 24 comptes rangés dans l'OU de leur service, `Department` renseigné. La commande d'import et les paramètres (UPN, changement de mot de passe, compte actif) restent à documenter. |
+| 🟢 | Modèle AGDLP | Fait | `GG_<Métier>` → `DL_<Service>_RW` ; `GG_Direction` → `DL_<Service>_R`. |
+| 🟢 | File server (`D:\Shares\…`, SMB, ACL sur groupes) | Fait | Aucun compte utilisateur dans les ACL ni dans les permissions de partage. |
+| 🟢 | Tests utilisateurs (Finance, IT, Direction) | À documenter | Procédure en B11 ; sorties réelles à joindre. |
+| 🟠 | Délégation Helpdesk | **Appliquée et testée** | A5 appliqué le 2026-10-02 : 9 ACE sur les objets `user`. Validés en session Helpdesk : reset du mot de passe, déverrouillage, modification d'attributs ; refus pour le groupe privilégié, un attribut non délégué, la désactivation, `Administrateur`, un objet GPO et la création d'OU. Droits effectifs = exactement les 8 attributs délégués. Reste : test direct de suppression d'OU (optionnel). |
+| 🔴 | Preuve de la délégation (provider `AD:`) | Fait | Relevés avant / après A5 et droits effectifs en B10. |
+
+---
+
+## 2. Modèle AGDLP et matrice d'accès (livrable)
+
+```text
+Utilisateur → GG_<MÉTIER> → DL_<RESSOURCE>_RW / R → ACL
+```
+
+### Groupes
+
+| Groupe global | Membres | Membre de |
+|---|---|---|
+| `GG_Finance` | 5 | `DL_Finance_RW` |
+| `GG_IT` | 5 | `DL_IT_RW` |
+| `GG_RH` | 5 | `DL_RH_RW` |
+| `GG_Support` | 5 | `DL_Support_RW` |
+| `GG_Direction` | 4 | `DL_Finance_R`, `DL_IT_R`, `DL_RH_R`, `DL_Support_R`, `DL_Direction_RW` |
+| `GG_HELPDESK` | 5 (utilisateurs de l'OU Support) | `DL_Support_RW` |
+
+### Qui peut lire / écrire où
+
+| Groupe | Finance | IT | RH | Support |
+|---|---|---|---|---|
+| `GG_Finance` | RW | - | - | - |
+| `GG_IT` | - | RW | - | - |
+| `GG_RH` | - | - | RW | - |
+| `GG_Support` | - | - | - | RW |
+| `GG_Direction` | R | R | R | R |
+| `GG_HELPDESK` | - | - | - | RW |
+
+### Partages
+
+| Partage | Chemin | Modification | Lecture |
+|---|---|---|---|
+| `\\SRV01\Finance` | `D:\Shares\Finance` | `DL_Finance_RW` | `DL_Finance_R` |
+| `\\SRV01\IT` | `D:\Shares\IT` | `DL_IT_RW` | `DL_IT_R` |
+| `\\SRV01\RH` | `D:\Shares\RH` | `DL_RH_RW` | `DL_RH_R` |
+| `\\SRV01\Support` | `D:\Shares\Support` | `DL_Support_RW` | `DL_Support_R` |
+
+- NTFS : héritage coupé sur chaque dossier, contrôle total pour `Administrateurs` et `SYSTEM`, aucun compte utilisateur, aucun groupe `Utilisateurs`.
+- Partages SMB : `Admins du domaine` en contrôle total, `DL_*_RW` en modification, `DL_*_R` en lecture.
+- Énumération basée sur l'accès : un utilisateur ne voit que ce à quoi il a droit.
+
+### Annuaire
+
+OU `NovaCorp` avec les sous-OU `Direction`, `Finance`, `IT`, `RH`, `Support` et `Groups` (les groupes `DL_*`). Les OU `Servers` et `Workstation` existent à la racine du domaine. Les 24 utilisateurs sont rangés dans l'OU de leur service, avec le champ `Department` renseigné.
+
+---
+
+## Partie A — Setup (dans l'ordre)
+
+### A0. Prérequis déjà en place (TP00 / TP01)
+
+SRV01 est joint à `novacorp.test`, IP `10.100.12.14` (Ethernet1, bridge), DNS sur DC01 puis DC02. La jonction a été faite avec des identifiants saisis à la console, sans mot de passe dans la commande :
+
+```powershell
+$pwd  = Read-Host "Mot de passe NOVACORP\Administrateur" -AsSecureString
+$cred = New-Object System.Management.Automation.PSCredential("NOVACORP\Administrateur", $pwd)
+Add-Computer -DomainName "novacorp.test" -Credential $cred -Restart
+```
+
+### A1. Disque dédié aux partages (`D:`)
+
+Le lecteur `D:` était le DVD d'installation des VM tools : il a été déplacé sur `Z:`, puis un disque virtuel de 20 Go (ajouté dans VMware) a pris la lettre `D:`.
+
+```powershell
+# Libérer D: (le DVD passe sur Z:)
+Get-CimInstance Win32_Volume -Filter "DriveLetter='D:'" | Set-CimInstance -Property @{DriveLetter='Z:'}
+
+# Après ajout du disque dans VMware
+Update-HostStorageCache
+Get-Disk | Select Number, FriendlyName, Size, PartitionStyle, OperationalStatus
+
+Set-Disk -Number 1 -IsOffline $false
+Set-Disk -Number 1 -IsReadOnly $false
+Get-Disk -Number 1 | Initialize-Disk -PartitionStyle GPT -PassThru |
+  New-Partition -DriveLetter D -UseMaximumSize |
+  Format-Volume -FileSystem NTFS -NewFileSystemLabel "Shares" -Confirm:$false
+```
+
+### A2. Groupes de domaine local, dossiers, droits NTFS, partages SMB
+
+```powershell
+Install-WindowsFeature RSAT-AD-PowerShell | Out-Null
+$svc = "Finance","IT","RH","Support"
+
+# 1. Groupes DL : RW (modification) et R (lecture) par service
+foreach ($s in $svc) {
+    foreach ($p in "RW","R") {
+        $n = "DL_${s}_${p}"
+        if (-not (Get-ADGroup -Filter "Name -eq '$n'")) {
+            New-ADGroup -Name $n -GroupScope DomainLocal -GroupCategory Security -Description "Acces $p au partage $s"
+        }
+    }
+}
+
+# 2. Dossiers
+foreach ($s in $svc) { New-Item -ItemType Directory -Path "D:\Shares\$s" -Force | Out-Null }
+
+# 3. NTFS : héritage coupé, uniquement des groupes (SID : Administrateurs = S-1-5-32-544, SYSTEM = S-1-5-18)
+foreach ($s in $svc) {
+    $path = "D:\Shares\$s"
+    icacls $path /inheritance:r | Out-Null
+    icacls $path /grant "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+    icacls $path /grant "NOVACORP\DL_${s}_RW:(OI)(CI)M" | Out-Null
+    icacls $path /grant "NOVACORP\DL_${s}_R:(OI)(CI)RX" | Out-Null
+}
+
+# 4. Partages SMB
+foreach ($s in $svc) {
+    New-SmbShare -Name $s -Path "D:\Shares\$s" `
+        -FullAccess "NOVACORP\Admins du domaine" `
+        -ChangeAccess "NOVACORP\DL_${s}_RW" `
+        -ReadAccess "NOVACORP\DL_${s}_R" `
+        -FolderEnumerationMode AccessBased
+}
+```
+
+### A3. Groupes globaux `GG_*`, alimentation et imbrication AGDLP
+
+Les groupes globaux n'existaient pas encore : ils ont été créés dans l'OU de chaque service, alimentés avec les utilisateurs de l'OU, puis imbriqués dans les `DL_*`.
+
+```powershell
+$base = "OU=NovaCorp,DC=novacorp,DC=test"
+$svc  = "Finance","IT","RH","Support"
+
+# 1. Groupes globaux (Direction incluse)
+foreach ($s in $svc + "Direction") {
+    $n  = "GG_$s"
+    $ou = "OU=$s,$base"
+    if (-not (Get-ADGroup -Filter "Name -eq '$n'")) {
+        New-ADGroup -Name $n -GroupScope Global -GroupCategory Security -Path $ou -Description "Metier $s"
+    }
+}
+
+# 2. Utilisateurs de chaque OU -> groupe global correspondant
+foreach ($s in $svc + "Direction") {
+    $users = Get-ADUser -Filter * -SearchBase "OU=$s,$base" -SearchScope Subtree
+    if ($users) { Add-ADGroupMember -Identity "GG_$s" -Members $users -ErrorAction SilentlyContinue }
+    "GG_{0} : {1} utilisateur(s) dans l'OU" -f $s, @($users).Count
+}
+
+# 3. AGDLP : GG métier -> DL_RW de son service ; GG_Direction -> DL_R de tous les services
+foreach ($s in $svc) {
+    Add-ADGroupMember -Identity "DL_${s}_RW" -Members "GG_$s"        -ErrorAction SilentlyContinue
+    Add-ADGroupMember -Identity "DL_${s}_R"  -Members "GG_Direction" -ErrorAction SilentlyContinue
+}
+```
+
+### A4. Rangement des groupes de ressources
+
+```powershell
+New-ADOrganizationalUnit -Name "Groups" -Path "OU=NovaCorp,DC=novacorp,DC=test"
+Get-ADGroup -Filter "Name -like 'DL_*'" | Move-ADObject -TargetPath "OU=Groups,OU=NovaCorp,DC=novacorp,DC=test"
+```
+
+Les droits ne changent pas : les ACL utilisent les SID des groupes, pas leur emplacement.
+
+### A5. Délégation Helpdesk (challenge 🟠)
+
+> **État : appliquée le 2026-10-02**, avec l'accord du collègue qui avait créé `GG_HELPDESK`. Avant l'application, le relevé (B10) montrait des ACE sur les objets `computer` uniquement. L'ACL de l'OU a été sauvegardée avant modification dans `C:\Temp\NovaCorp-ACL-avant-A5.sddl`.
+
+Le bloc ci-dessous ajoute des droits et n'en retire aucun.
+
+```powershell
+Import-Module ActiveDirectory
+$target = "OU=NovaCorp,DC=novacorp,DC=test"
+
+# Sauvegarde de l'ACL avant modification
+New-Item -ItemType Directory -Path C:\Temp -Force | Out-Null
+(Get-Acl "AD:$target").Sddl | Out-File C:\Temp\NovaCorp-ACL-avant-A5.sddl
+
+$ns   = (Get-ADGroup GG_HELPDESK).SID
+$sch  = (Get-ADRootDSE).schemaNamingContext
+function G($n) { [guid](Get-ADObject -SearchBase $sch -LDAPFilter "(lDAPDisplayName=$n)" -Properties schemaIDGUID).schemaIDGUID }
+$user  = G "user"
+$reset = [guid]"00299570-246d-11d0-a768-00aa006e0529"     # droit étendu Reset Password
+
+$acl = Get-Acl "AD:$target"
+$mk  = { param($rights,$guid) New-Object System.DirectoryServices.ActiveDirectoryAccessRule($ns,$rights,"Allow",$guid,"Descendents",$user) }
+$acl.AddAccessRule((& $mk "ExtendedRight" $reset))
+foreach ($a in "lockoutTime","pwdLastSet","telephoneNumber","mail","title","department","physicalDeliveryOfficeName","description") {
+    $acl.AddAccessRule((& $mk "WriteProperty" (G $a)))
+}
+Set-Acl "AD:$target" $acl
+```
+
+Retour arrière, si besoin :
+
+```powershell
+$acl = Get-Acl "AD:$target"
+$acl.SetSecurityDescriptorSddlForm((Get-Content C:\Temp\NovaCorp-ACL-avant-A5.sddl))
+Set-Acl "AD:$target" $acl
+```
+
+La cible `OU=Users` du TP n'existe pas dans cet annuaire : la délégation est posée sur `OU=NovaCorp` (comptes utilisateurs des services, hors compte `Administrateur`).
+
+### A6. Génération de la matrice d'accès
+
+Sortie à coller dans la section 2 :
+
+```powershell
+$svc = "Finance","IT","RH","Support"
+$rows = foreach ($gg in ($svc + "Direction" | ForEach-Object { "GG_$_" })) {
+    $cells = foreach ($s in $svc) {
+        $rw = (Get-ADGroupMember "DL_${s}_RW").Name -contains $gg
+        $r  = (Get-ADGroupMember "DL_${s}_R").Name  -contains $gg
+        if ($rw) {"RW"} elseif ($r) {"R"} else {"-"}
+    }
+    "| $gg | " + ($cells -join " | ") + " |"
+}
+"| Groupe | Finance | IT | RH | Support |"; "|---|---|---|---|---|"; $rows
+```
+
+---
+
+## Partie B — Vérifications, point par point
+
+Toutes se lancent sur SRV01, sauf indication contraire.
+
+### B1. Disque `D:`
+
+```powershell
+Get-Volume -DriveLetter D            # Shares, NTFS, Healthy
+Get-Volume -DriveLetter Z            # le DVD
+```
+
+Attendu : `D` = `Shares`, `NTFS`, `Healthy`, environ 20 Go.
+
+### B2. Dossiers
+
+```powershell
+Get-ChildItem D:\Shares | Select Name
+```
+
+Attendu : `Finance`, `IT`, `RH`, `Support`.
+
+### B3. Partages SMB
+
+```powershell
+Get-SmbShare | Where Name -in "Finance","IT","RH","Support" | Select Name, Path, FolderEnumerationMode
+Get-SmbShareAccess -Name Finance,IT,RH,Support | Format-Table Name, AccountName, AccessRight -AutoSize
+```
+
+Attendu : 4 partages ; par partage, `Admins du domaine` en `Full`, `DL_*_RW` en `Change`, `DL_*_R` en `Read` ; `FolderEnumerationMode = AccessBased`. Aucun compte utilisateur.
+
+### B4. Droits NTFS
+
+```powershell
+foreach ($s in "Finance","IT","RH","Support") { icacls "D:\Shares\$s" }
+(Get-Acl D:\Shares\Finance).AreAccessRulesProtected      # True = héritage coupé
+```
+
+Attendu : `Administrateurs` et `Système` en `(F)`, `DL_<service>_RW` en `(M)`, `DL_<service>_R` en `(RX)`, rien d'autre (ni `Utilisateurs`, ni compte nominatif). `BUILTIN\Administrateurs` apparaît deux fois : sans conséquence.
+
+### B5. Groupes de domaine local
+
+```powershell
+Get-ADGroup -Filter "Name -like 'DL_*'" | Select Name, GroupScope, @{n="OU";e={($_.DistinguishedName -split ',',2)[1]}} | Sort Name
+```
+
+Attendu : les 8 groupes des services plus les `DL_Direction_*` (10 au total d'après l'annuaire), tous `DomainLocal`, dans `OU=Groups,OU=NovaCorp`.
+
+### B6. Groupes globaux et leurs membres
+
+```powershell
+Get-ADGroup -Filter "Name -like 'GG_*'" -Properties Members | Select Name, GroupScope, @{n="Membres";e={$_.Members.Count}}
+Get-ADGroupMember GG_Finance | Select Name, objectClass
+```
+
+Attendu : `GG_Finance`, `GG_IT`, `GG_RH`, `GG_Support` (5 membres chacun), `GG_Direction` (4), tous `Global`. Les membres sont des objets `user`.
+
+### B7. Sens de l'imbrication (AGDLP)
+
+```powershell
+# Les membres de DL_Finance_RW doivent être des groupes (GG_Finance)
+Get-ADGroupMember DL_Finance_RW | Select Name, objectClass
+# GG_Finance doit être membre de DL_Finance_RW
+(Get-ADGroup GG_Finance -Properties MemberOf).MemberOf
+# Récapitulatif de tous les DL
+foreach ($g in "Finance","IT","RH","Support") { foreach ($p in "RW","R") {
+    "DL_${g}_${p} <- " + ((Get-ADGroupMember "DL_${g}_${p}").Name -join ", ") } }
+```
+
+Attendu : `DL_<service>_RW` contient `GG_<service>` ; `DL_<service>_R` contient `GG_Direction`.
+
+### B8. Utilisateurs rangés par OU, avec leur service
+
+```powershell
+Get-ADUser -Filter * -SearchBase "OU=NovaCorp,DC=novacorp,DC=test" -Properties Department,Enabled,MemberOf |
+  Select SamAccountName, Department, Enabled,
+    @{n="OU";e={($_.DistinguishedName -split ',',2)[1]}},
+    @{n="Groupes";e={($_.MemberOf | % { ($_ -split ',')[0] -replace '^CN=' }) -join ", "}} |
+  Sort OU | Format-Table -AutoSize
+```
+
+Attendu : chaque utilisateur est actif, dans l'OU de son service, avec le bon `Department` et le groupe `GG_` correspondant.
+
+### B9. Groupes privilégiés
+
+```powershell
+Get-ADGroupMember "Admins du domaine" | Select Name
+Get-ADGroupMember "Administrateurs"   | Select Name
+```
+
+Attendu : aucun compte nominatif de test, ni `GG_HELPDESK`.
+
+### B10. Délégation Helpdesk
+
+#### Relevé de l'état du groupe (lecture seule, 2026-10-02)
+
+```powershell
+Get-ADGroup GG_HELPDESK -Properties Members | Select Name, GroupScope, @{n="Membres";e={$_.Members.Count}}
+Get-ADGroupMember GG_HELPDESK | Select Name, objectClass
+
+# Il ne doit être dans aucun groupe privilégié (imbrications comprises)
+foreach ($g in "Admins du domaine","Administrateurs","Administrateurs de l’entreprise","Administrateurs du schéma") {
+    "{0} : {1}" -f $g, ((Get-ADGroupMember $g -Recursive -ErrorAction SilentlyContinue).Name -contains "GG_HELPDESK")
+}
+(Get-ADGroup GG_HELPDESK -Properties MemberOf).MemberOf
+```
+
+Résultat obtenu :
+
+```text
+Name        GroupScope Membres
+GG_HELPDESK     Global       5
+
+Gabriel Michel, Jade Lefevre, Arthur Garcia, Jules Vincent, Paul Andre   (tous objectClass user)
+
+Admins du domaine : False
+Administrateurs : False
+Administrateurs de l’entreprise : False
+Administrateurs du schéma : False
+
+CN=DL_Support_RW,OU=Groups,OU=NovaCorp,DC=novacorp,DC=test
+```
+
+`GG_HELPDESK` est un groupe global de 5 utilisateurs. Il n'est dans aucun groupe privilégié et il est membre de `DL_Support_RW` (accès en modification au partage Support).
+
+#### Relevé des ACE posées sur l'OU (provider `AD:`)
+
+```powershell
+$target = "OU=NovaCorp,DC=novacorp,DC=test"
+$root = Get-ADRootDSE; $map = @{}
+Get-ADObject -SearchBase $root.schemaNamingContext -LDAPFilter "(schemaIDGUID=*)" -Properties schemaIDGUID,lDAPDisplayName |
+  ForEach-Object { $map[([guid]$_.schemaIDGUID).Guid] = $_.lDAPDisplayName }
+Get-ADObject -SearchBase "CN=Extended-Rights,$($root.configurationNamingContext)" -LDAPFilter "(objectClass=controlAccessRight)" -Properties rightsGuid,displayName |
+  ForEach-Object { $map[$_.rightsGuid] = $_.displayName }
+function Nom($g) { $s = [string]$g; if ($map.ContainsKey($s)) { $map[$s] } else { $s } }
+
+(Get-Acl "AD:$target").Access | Where-Object { $_.IdentityReference -like "*GG_HELPDESK" } |
+  Select AccessControlType, ActiveDirectoryRights, InheritanceType,
+    @{n="ObjectType";e={ Nom $_.ObjectType }}, @{n="InheritedObjectType";e={ Nom $_.InheritedObjectType }} |
+  Format-Table -AutoSize
+
+# Optionnel : nécessite les outils AD DS (Install-WindowsFeature RSAT-AD-Tools)
+dsacls $target | Select-String "GG_HELPDESK"
+```
+
+Résultat obtenu avant application de A5 :
+
+```text
+AccessControlType ActiveDirectoryRights InheritanceType ObjectType                           InheritedObjectType
+Allow             WriteProperty         Descendents     00000000-0000-0000-0000-000000000000 computer
+Allow             ExtendedRight         Descendents     00299570-66d5-11d1-9b21-00c04fb951ed computer
+```
+
+| Droit | Objet | S'applique à |
+|---|---|---|
+| `WriteProperty` | toutes les propriétés | objets `computer` |
+| `ExtendedRight` | GUID `00299570-66d5-11d1-9b21-00c04fb951ed` (non reconnu dans le schéma) | objets `computer` |
+
+**Constat avant A5 :** aucune ACE ne vise les objets `user`. Le GUID du droit étendu n'est pas celui de *Reset Password* (`00299570-246d-11d0-a768-00aa006e0529`). La délégation demandée par le TP n'était donc pas en place.
+
+Résultat obtenu **après** application de A5 (même commande, 2026-10-02) :
+
+```text
+AccessControlType ActiveDirectoryRights InheritanceType ObjectType                           InheritedObjectType
+Allow             WriteProperty         Descendents     physicalDeliveryOfficeName           user
+Allow             WriteProperty         Descendents     00000000-0000-0000-0000-000000000000 computer
+Allow             WriteProperty         Descendents     lockoutTime                          user
+Allow             WriteProperty         Descendents     mail                                 user
+Allow             WriteProperty         Descendents     title                                user
+Allow             WriteProperty         Descendents     description                          user
+Allow             WriteProperty         Descendents     department                           user
+Allow             WriteProperty         Descendents     telephoneNumber                      user
+Allow             WriteProperty         Descendents     pwdLastSet                           user
+Allow             ExtendedRight         Descendents     00299570-66d5-11d1-9b21-00c04fb951ed computer
+Allow             ExtendedRight         Descendents     Reset Password                       user
+```
+
+**Constat après A5 :** 9 ACE visent désormais les objets `user` (*Reset Password* et `WriteProperty` sur `lockoutTime`, `pwdLastSet`, `telephoneNumber`, `mail`, `title`, `department`, `physicalDeliveryOfficeName`, `description`), toutes en `Allow` avec héritage `Descendents`. Aucun droit large (`GenericAll`, `WriteDacl`, `Delete`, `CreateChild`). Les deux ACE d'origine sur `computer` sont inchangées ; le GUID `00299570-66d5-11d1-…` y est toujours non reconnu (à signaler au collègue).
+
+#### Contrôle de l'absence de droits excessifs (lecture seule)
+
+```powershell
+# Pas de droit large sur l'OU
+(Get-Acl "AD:$target").Access | Where-Object { $_.IdentityReference -like "*GG_HELPDESK" -and
+  $_.ActiveDirectoryRights -match "GenericAll|WriteDacl|WriteOwner|Delete|CreateChild|DeleteChild" }
+
+# Pas de droit sur le conteneur des GPO
+(Get-Acl "AD:CN=Policies,CN=System,DC=novacorp,DC=test").Access | Where-Object { $_.IdentityReference -like "*GG_HELPDESK" }
+```
+
+Résultat obtenu : **aucune ligne** pour les deux commandes. `GG_HELPDESK` n'a ni droit de suppression ni droit de modification des permissions sur l'OU, et aucun droit sur les GPO du domaine.
+
+#### Tests fonctionnels
+
+##### Résultats obtenus en session Helpdesk (2026-10-02)
+
+Session ouverte avec un compte membre de `GG_HELPDESK`. RSAT n'étant pas installé sur le poste, les tests sont faits en ADSI (`[adsisearcher]` / `[adsi]`), ce qui passe par les mêmes ACL.
+
+Preuve d'identité :
+
+```text
+PS> whoami /groups | findstr HELPDESK
+NOVACORP\GG_HELPDESK   Groupe   S-1-5-21-1723281579-3114997196-3702512319-1131   Groupe obligatoire, Activé par défaut, Groupe activé
+```
+
+Opérations déléguées sur `alice.martin` :
+
+```powershell
+$u = ([adsisearcher]"(sAMAccountName=alice.martin)").FindOne().GetDirectoryEntry()
+$u.SetPassword("<mot de passe de test>")
+$u.Put("lockoutTime", 0); $u.SetInfo()
+$u.Put("title", "Comptable"); $u.SetInfo()
+$u.RefreshCache(); $u.title
+```
+
+```text
+Comptable
+```
+
+Aucune erreur sur les trois écritures.
+
+Opération non déléguée (ajout d'un utilisateur à `Admins du domaine`) :
+
+```powershell
+$g = ([adsisearcher]"(cn=Admins du domaine)").FindOne().GetDirectoryEntry()
+$g.Add("LDAP://" + ([adsisearcher]"(sAMAccountName=paul.andre)").FindOne().Properties.distinguishedname)
+```
+
+```text
+Exception lors de l'appel de «Add» avec «1» argument(s): «Accès refusé. (Exception de HRESULT : 0x80070005 (E_ACCESSDENIED))»
+```
+
+| Test | Attendu | Résultat |
+|---|---|---|
+| Reset du mot de passe (`SetPassword`) | autorisé | ✅ réussi |
+| Déverrouillage (`lockoutTime` = 0) | autorisé | ✅ réussi |
+| Modification de `title` | autorisé | ✅ réussi, relecture « Comptable » |
+| Ajout à `Admins du domaine` | refusé | ✅ `E_ACCESSDENIED` (0x80070005) |
+| Création d'un fichier dans `SYSVOL\…\Policies` | refusé | ⚠️ refusé, mais peu probant : tout utilisateur standard du domaine est refusé aussi |
+
+##### Compléments : création d'OU, droits effectifs, refus ciblés (2026-10-02)
+
+Création d'une OU sous `OU=NovaCorp` :
+
+```powershell
+$ou = ([adsi]"LDAP://OU=NovaCorp,DC=novacorp,DC=test").Create("organizationalUnit", "OU=TestDel")
+$ou.SetInfo()
+```
+
+```text
+Exception lors de l'appel de « SetInfo » avec « 0 » argument(s) : « Accès refusé. »
+```
+
+Droits effectifs (attributs construits `allowedAttributesEffective` et `allowedChildClassesEffective`, lecture seule) :
+
+```powershell
+function Get-Eff($dn, $prop) { $e = [adsi]"LDAP://$dn"; $e.RefreshCache(@($prop)); $e.Properties[$prop] | Sort-Object }
+$hugo = ([adsisearcher]"(sAMAccountName=hugo.bernard)").FindOne().Properties.distinguishedname[0]
+$da   = ([adsisearcher]"(cn=Admins du domaine)").FindOne().Properties.distinguishedname[0]
+
+"--- Utilisateur standard";                    Get-Eff $hugo "allowedAttributesEffective"
+"--- Objets créables dans OU=NovaCorp";        Get-Eff "OU=NovaCorp,DC=novacorp,DC=test" "allowedChildClassesEffective"
+"--- Objets créables dans CN=Policies";        Get-Eff "CN=Policies,CN=System,DC=novacorp,DC=test" "allowedChildClassesEffective"
+"--- Admins du domaine";                       Get-Eff $da "allowedAttributesEffective"
+```
+
+```text
+--- Utilisateur standard
+department
+description
+lockoutTime
+mail
+physicalDeliveryOfficeName
+pwdLastSet
+telephoneNumber
+title
+--- Objets créables dans OU=NovaCorp
+--- Objets créables dans CN=Policies
+--- Admins du domaine
+```
+
+Refus ciblés (chaque test s'annule tout seul s'il réussit à tort) :
+
+```powershell
+function Fresh($f) { ([adsisearcher]$f).FindOne().GetDirectoryEntry() }
+
+$h = Fresh "(sAMAccountName=hugo.bernard)"
+try { $h.Put("company","Test"); $h.SetInfo(); "[FAIL] company"; $h.PutEx(1,"company",0); $h.SetInfo() }
+catch { "[PASS] company refusé : $($_.Exception.Message)" }
+
+$h = Fresh "(sAMAccountName=hugo.bernard)"; $uac = [int]$h.userAccountControl.Value
+try { $h.Put("userAccountControl",($uac -bor 2)); $h.SetInfo(); "[FAIL] désactivation"; $h.Put("userAccountControl",$uac); $h.SetInfo() }
+catch { "[PASS] désactivation refusée : $($_.Exception.Message)" }
+
+$a = Fresh "(sAMAccountName=Administrateur)"; $old = $a.description.Value
+try { $a.Put("description","test"); $a.SetInfo(); "[FAIL] Administrateur"
+      if ($old) { $a.Put("description",$old) } else { $a.PutEx(1,"description",0) }; $a.SetInfo() }
+catch { "[PASS] Administrateur protégé : $($_.Exception.Message)" }
+
+$gpo = [adsi]"LDAP://CN={31B2F340-016D-11D2-945F-00C04FB984F9},CN=Policies,CN=System,DC=novacorp,DC=test"
+try { $gpo.Put("description","test"); $gpo.SetInfo(); "[FAIL] GPO"; $gpo.PutEx(1,"description",0); $gpo.SetInfo() }
+catch { "[PASS] GPO protégée : $($_.Exception.Message)" }
+```
+
+```text
+[PASS] company refusé : … « Accès refusé. »
+[PASS] désactivation refusée : … « Accès refusé. »
+[PASS] Administrateur protégé : … « Accès refusé. »
+[PASS] GPO protégée : … « Accès refusé. »
+```
+
+| Test | Attendu | Résultat |
+|---|---|---|
+| Création d'une OU sous `OU=NovaCorp` | refusé | ✅ Accès refusé |
+| Attributs modifiables sur un utilisateur | exactement les 8 attributs délégués | ✅ `department`, `description`, `lockoutTime`, `mail`, `physicalDeliveryOfficeName`, `pwdLastSet`, `telephoneNumber`, `title` |
+| Objets créables dans `OU=NovaCorp` | aucun | ✅ liste vide |
+| Objets créables dans `CN=Policies` (GPO) | aucun | ✅ liste vide |
+| Attributs modifiables sur `Admins du domaine` | aucun | ✅ liste vide |
+| Écriture d'un attribut non délégué (`company`) | refusé | ✅ |
+| Désactivation du compte (`userAccountControl`) | refusé | ✅ |
+| Modification du compte `Administrateur` | refusé | ✅ |
+| Modification d'un objet GPO (Default Domain Policy, attribut `description`) | refusé | ✅ (un utilisateur standard serait refusé aussi : cela montre l'absence de droit sur les GPO) |
+| Suppression d'une OU | refusé | ⏳ pas de test direct (voir ci-dessous) |
+
+**Suppression d'OU.** Le test `DeleteTree` visait `OU=TestDel`, qui n'existe pas puisque sa création est refusée : l'erreur « Cet objet ne se trouve pas sur le serveur » ne prouve donc rien. La preuve actuelle est indirecte : `GG_HELPDESK` n'a aucune ACE `Delete`, `DeleteChild` ni `CreateChild` sur l'OU (contrôle plus haut) et `allowedChildClassesEffective` est vide. Pour un test direct, un administrateur crée une OU jetable, le Helpdesk tente de la supprimer, puis l'administrateur la nettoie :
+
+```powershell
+# Session ADMIN
+New-ADOrganizationalUnit TestDel -Path "OU=NovaCorp,DC=novacorp,DC=test" -ProtectedFromAccidentalDeletion $false
+# Session HELPDESK : attendu « Accès refusé »
+([adsi]"LDAP://OU=TestDel,OU=NovaCorp,DC=novacorp,DC=test").DeleteTree()
+# Session ADMIN : nettoyage
+Remove-ADOrganizationalUnit "OU=TestDel,OU=NovaCorp,DC=novacorp,DC=test" -Recursive -Confirm:$false
+```
+
+Ne jamais lancer `DeleteTree` sur une vraie OU.
+
+##### Procédure complète (cmdlets AD)
+
+> **À lancer uniquement depuis une session d'un membre de `GG_HELPDESK`, jamais depuis une session administrateur.** Depuis un compte admin, tous les tests réussissent et modifient l'annuaire sans rien prouver. Vérifier d'abord l'identité :
+>
+> ```powershell
+> whoami
+> whoami /groups | findstr /i HELPDESK
+> ```
+
+Prérequis dans cette session : `Install-WindowsFeature RSAT-AD-PowerShell, GPMC`. Sans eux, `New-GPO` renvoie « terme non reconnu », ce qui n'est pas un refus d'accès.
+
+```powershell
+$cible = "<un.utilisateur.de.test>"     # compte de test, pas un compte réel ni Administrateur
+
+# Autorisés (attendu : réussite)
+Set-ADAccountPassword $cible -Reset -NewPassword (Read-Host -AsSecureString "Nouveau mdp")
+Unlock-ADAccount $cible
+Set-ADUser $cible -Title "Test helpdesk" -OfficePhone "0102030405"
+Get-ADUser $cible -Properties Title,OfficePhone | Select Title,OfficePhone
+
+# Refusés (attendu : accès refusé)
+Add-ADGroupMember "Admins du domaine" -Members $cible
+New-GPO -Name "Test-Helpdesk"
+Set-ADUser Administrateur -Description "test"
+```
+
+Si l'un des tests « refusés » réussit, le retirer immédiatement (`Remove-ADGroupMember`, `Remove-GPO`) et corriger la délégation.
+
+La suppression d'OU n'est pas testée par commande : l'OU est protégée contre la suppression accidentelle, donc l'échec ne prouverait rien. La preuve est l'absence de droit `Delete` / `DeleteChild` sur l'OU pour `GG_HELPDESK` (contrôle ci-dessus).
+
+#### Mécanisme de délégation (🔴 Expert)
+
+Principe (confirmé par le relevé des ACE et par les tests en session Helpdesk ci-dessus) :
+
+- La délégation est une **ACE dans la DACL de l'OU** `OU=NovaCorp`, posée avec `Set-Acl` sur le provider `AD:`.
+- Elle est portée par `GG_HELPDESK` (SID du groupe), pas par des comptes.
+- Elle est **héritée** par les objets enfants (`InheritanceType = Descendents`) et **limitée aux objets `user`** grâce à `InheritedObjectType = user` : elle ne s'applique pas aux groupes, aux OU ni aux GPO.
+- Le *reset password* passe par un droit étendu (`ExtendedRight`, GUID `00299570-246d-11d0-a768-00aa006e0529`). Le déverrouillage passe par `WriteProperty` sur `lockoutTime` (avec `pwdLastSet` pour la réinitialisation). Les attributs usuels (`telephoneNumber`, `mail`, `title`, `department`, `physicalDeliveryOfficeName`, `description`) sont accordés en `WriteProperty` ciblé.
+- `Administrateur` est dans `CN=Users`, hors de l'OU où la délégation est posée : elle ne s'y applique pas (modification refusée en session Helpdesk). Les comptes membres de groupes privilégiés sont en plus protégés par **AdminSDHolder** (ACL réinitialisée régulièrement, héritage coupé), ce qui les écarterait de la délégation même s'ils se trouvaient dans l'OU.
+- Le Helpdesk ne peut pas ajouter de membre à `Admins du domaine` : aucun droit en écriture sur ce groupe (`allowedAttributesEffective` vide, ajout refusé en `E_ACCESSDENIED`).
+- Les droits effectifs relevés sur un utilisateur correspondent exactement aux 8 attributs délégués ; aucun objet n'est créable dans l'OU ni dans le conteneur des GPO.
+
+### B11. Tests d'accès depuis un poste client (preuves pour la matrice)
+
+Depuis un poste du domaine, ou avec des identifiants du domaine saisis à la demande. À faire pour au moins un utilisateur Finance, un utilisateur IT et un utilisateur Direction :
+
+```powershell
+net use \\SRV01\Finance /user:NOVACORP\<utilisateur.finance> *
+New-Item \\SRV01\Finance\test.txt -ItemType File      # Finance : autorisé
+dir \\SRV01\RH                                        # Finance : accès refusé
+net use * /delete
+```
+
+Résultats attendus :
+
+| Utilisateur | `\\SRV01\<propre service>` | Autre service |
+|---|---|---|
+| Finance / IT / RH / Support | lecture et écriture | refusé |
+| Direction | lecture seule sur les 4 | écriture refusée |
+
+L'utilisateur doit s'être connecté au moins une fois (changement du mot de passe initial), et une session déjà ouverte doit être fermée puis rouverte pour prendre en compte ses nouveaux groupes. Pour voir le rôle d'un utilisateur sans connaître son mot de passe : `whoami /groups` dans sa session. Nettoyage : `Remove-Item D:\Shares\*\test*.txt`.
+
+### B12. Accès par le nom (et non par l'IP)
+
+```powershell
+Resolve-DnsName srv01.novacorp.test       # doit renvoyer uniquement 10.100.12.14
+Test-NetConnection SRV01 -Port 445        # depuis un autre poste
+```
+
+---
+
+## Partie C — Contrôle global en une passe
+
+Ce script ne modifie rien et affiche `[PASS]` / `[FAIL]` pour les points B1 à B7. Il suppose le modèle du TP02 (4 services plus Direction en lecture).
+
+```powershell
+$svc = "Finance","IT","RH","Support"
+function R($ok, $msg) { if ($ok) { Write-Host "[PASS] $msg" -ForegroundColor Green } else { Write-Host "[FAIL] $msg" -ForegroundColor Red } }
+
+$v = Get-Volume -DriveLetter D -ErrorAction SilentlyContinue
+R ($v -and $v.FileSystemType -eq 'NTFS') "Volume D: NTFS"
+
+foreach ($s in $svc) {
+    $path = "D:\Shares\$s"
+    R (Test-Path $path) "Dossier $path"
+
+    $sh = Get-SmbShare -Name $s -ErrorAction SilentlyContinue
+    R ($sh -and $sh.Path -eq $path) "Partage \\SRV01\$s -> $path"
+    R ($sh -and [string]$sh.FolderEnumerationMode -eq 'AccessBased') "Partage $s : énumération basée sur l'accès"
+
+    if ($sh) {
+        $acc = @(Get-SmbShareAccess -Name $s)
+        $badShare = @($acc | Where-Object { $_.AccountName -notmatch '^NOVACORP\\(DL_|Admins du domaine)' -and $_.AccountName -notmatch '^(BUILTIN|AUTORITE NT|NT AUTHORITY)\\' })
+        R ($badShare.Count -eq 0) "Partage $s : uniquement des groupes ($(($acc.AccountName) -join ', '))"
+    }
+
+    if (Test-Path $path) {
+        $acl = Get-Acl $path
+        R $acl.AreAccessRulesProtected "NTFS $s : héritage coupé"
+        $bad = @($acl.Access | Where-Object {
+            $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $sid -notin 'S-1-5-32-544','S-1-5-18' -and $_.IdentityReference.Value -notlike 'NOVACORP\DL_*' })
+        R ($bad.Count -eq 0) "NTFS $s : aucun compte hors Administrateurs / SYSTEM / DL_*"
+    }
+
+    foreach ($p in "RW","R") {
+        $g = Get-ADGroup -Filter "Name -eq 'DL_${s}_${p}'" -ErrorAction SilentlyContinue
+        R ($g -and [string]$g.GroupScope -eq 'DomainLocal') "Groupe DL_${s}_${p} (DomainLocal)"
+    }
+    $gg = Get-ADGroup -Filter "Name -eq 'GG_$s'" -Properties Members -ErrorAction SilentlyContinue
+    R ($gg -and [string]$gg.GroupScope -eq 'Global' -and $gg.Members.Count -gt 0) "Groupe GG_$s (Global, $($gg.Members.Count) membre(s))"
+    $rw = Get-ADGroup -Filter "Name -eq 'DL_${s}_RW'" -Properties Members -ErrorAction SilentlyContinue
+    R ($gg -and $rw -and ($rw.Members -contains $gg.DistinguishedName)) "GG_$s est membre de DL_${s}_RW"
+    $r = Get-ADGroup -Filter "Name -eq 'DL_${s}_R'" -Properties Members -ErrorAction SilentlyContinue
+    $dir = Get-ADGroup -Filter "Name -eq 'GG_Direction'" -ErrorAction SilentlyContinue
+    R ($dir -and $r -and ($r.Members -contains $dir.DistinguishedName)) "GG_Direction est membre de DL_${s}_R"
+}
+```
+
+Un `[FAIL]` indique le point à revoir dans la partie B correspondante.
+
